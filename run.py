@@ -355,6 +355,17 @@ def main():
         required=True,
         help="Path to hands_track.pkl (list of dicts with 'frame', 'bbox', 'lr')",
     )
+    parser.add_argument(
+        "--right_img_folder",
+        type=str,
+        default=None,
+        help="Optional folder with right-eye images for stereo projection visualization",
+    )
+    parser.add_argument(
+        "--stereo_render",
+        action="store_true",
+        help="If set, project predicted 3D joints into right-eye images using fixed stereo calibration",
+    )
 
     args = parser.parse_args()
 
@@ -387,6 +398,7 @@ def main():
     render_save_path = os.path.join(base_dir, f"render_all_{model_cfg.EXTRA.FOCAL_LENGTH}")
     joint2d_save_path = os.path.join(base_dir, f"joint2d_{model_cfg.EXTRA.FOCAL_LENGTH}")
     vit_save_path = os.path.join(base_dir, f"vit_{model_cfg.EXTRA.FOCAL_LENGTH}")
+    right_joint2d_save_path = os.path.join(base_dir, f"joint2d_right_{model_cfg.EXTRA.FOCAL_LENGTH}")
     mesh_dir = os.path.join(base_dir, f"mesh_{model_cfg.EXTRA.FOCAL_LENGTH}")
     keypoint_json_save_path = os.path.join(base_dir, f"keypoint_json_{model_cfg.EXTRA.FOCAL_LENGTH}")
 
@@ -396,6 +408,22 @@ def main():
     os.makedirs(mesh_dir, exist_ok=True)
     os.makedirs(keypoint_json_save_path, exist_ok=True)
     os.makedirs(base_dir, exist_ok=True)
+    if args.stereo_render:
+        os.makedirs(right_joint2d_save_path, exist_ok=True)
+
+    # Stereo parameters (left -> right)
+    stereo_R = np.array([
+        [0.999989, 0.000601, -0.004678],
+        [-0.000607, 0.999999, -0.001161],
+        [0.004678, 0.001164, 0.999988],
+    ], dtype=np.float32)
+    stereo_T = np.array([-64.904110, -0.026841, 0.705546], dtype=np.float32)
+
+    right_intrinsics = np.array([
+        [716.787247, 0.0, 1438.987731],
+        [0.0, 717.310066, 1440.320132],
+        [0.0, 0.0, 1.0],
+    ], dtype=np.float32)
 
     # ------------------------------------------------------------------
     # 3. Collect image paths
@@ -440,6 +468,17 @@ def main():
         if img_cv2 is None:
             print("[WARN] Failed to read image:", img_path)
             continue
+
+        right_img_cv2 = None
+        if args.stereo_render:
+            if args.right_img_folder is None:
+                print("[WARN] Stereo render requested but --right_img_folder not set; skipping right-eye overlay")
+            else:
+                right_img_path = os.path.join(args.right_img_folder, os.path.basename(img_path))
+                right_img_cv2 = cv2.imread(right_img_path)
+                if right_img_cv2 is None:
+                    print("[WARN] Failed to read right-eye image:", right_img_path)
+                    args.stereo_render = False
 
         print("Processing frame", idx, ":", img_path)
 
@@ -738,7 +777,41 @@ def main():
                     circle_radius=4,
                     line_thickness=2,
                 )
-            
+
+            # --------------------------------------------
+            # Stereo projection to right-eye image
+            # --------------------------------------------
+            if args.stereo_render and right_img_cv2 is not None:
+                right_img_pred = right_img_cv2.copy()
+                for i in range(len(all_verts)):
+                    joints_left_cam = all_pred_3d[i] + all_cam_t[i]
+                    joints_right_cam = (stereo_R @ joints_left_cam.T).T + stereo_T
+
+                    proj = perspective_projection(
+                        torch.from_numpy(joints_right_cam)[None],
+                        rotation=torch.eye(3, dtype=torch.float32)[None],
+                        translation=torch.zeros((1, 3), dtype=torch.float32),
+                        focal_length=torch.tensor(
+                            [[right_intrinsics[0, 0], right_intrinsics[1, 1]]],
+                            dtype=torch.float32,
+                        ),
+                        camera_center=torch.tensor(
+                            [[right_intrinsics[0, 2], right_intrinsics[1, 2]]],
+                            dtype=torch.float32,
+                        ),
+                    )[0].numpy()
+
+                    valid = np.ones(proj.shape[0], dtype=bool)
+                    color = RIGHT_COLOR if all_right[i] == 1 else LEFT_COLOR
+                    _draw_hand(
+                        image=right_img_pred,
+                        keypoints=proj,
+                        valid=valid,
+                        color=color,
+                        circle_radius=4,
+                        line_thickness=2,
+                    )
+
 
             # --------------------------------------------
             # Draw bboxes (left: red, right: blue)
@@ -764,6 +837,8 @@ def main():
             cv2.imwrite(os.path.join(render_save_path, f"{img_fn}.jpg"), overlay_bgr)
             cv2.imwrite(os.path.join(joint2d_save_path, f"{img_fn}.jpg"), pred_img[:, :, ::-1])
             cv2.imwrite(os.path.join(vit_save_path, f"{img_fn}.jpg"), bbox_img[:, :, ::-1])
+            if args.stereo_render and right_img_cv2 is not None:
+                cv2.imwrite(os.path.join(right_joint2d_save_path, f"{img_fn}.jpg"), right_img_pred)
             print("saved image:", os.path.join(render_save_path, f"{img_fn}.jpg"))
 
         c = time.time()
